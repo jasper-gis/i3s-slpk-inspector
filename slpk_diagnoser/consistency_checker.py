@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from slpk_diagnoser.logger import get_logger
 from slpk_diagnoser.node_parser import NodeIndexDocSummary
 from slpk_diagnoser.nodepage_parser import NodePageRecord
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -24,7 +28,6 @@ def _infer_root(records: dict[int, NodePageRecord]) -> int:
         for c in r.children:
             children.add(c)
             parents.add(r.index)
-    # 出现在树中但非任何节点的子 => 可能是根
     roots = [idx for idx in records if idx not in children]
     if len(roots) == 1:
         return roots[0]
@@ -35,18 +38,22 @@ def check_tree_reachability(records: dict[int, NodePageRecord]) -> list[Consiste
     issues: list[ConsistencyIssue] = []
     if not records:
         issues.append(ConsistencyIssue("ERROR", "NO_NODES", "nodePage 中无有效节点", None))
+        logger.warning("未发现有效节点")
         return issues
     root = _infer_root(records)
     if root not in records:
         issues.append(ConsistencyIssue("ERROR", "NO_ROOT", "无法确定根节点索引", None))
+        logger.error("无法确定根节点")
         return issues
 
+    logger.debug(f"使用根节点: {root}")
     visited: set[int] = set()
     stack = [root]
 
     def dfs_cycle(idx: int, path: set[int]) -> bool:
         if idx in path:
             issues.append(ConsistencyIssue("ERROR", "CYCLE", f"检测到包含节点 {idx} 的环", idx))
+            logger.error(f"检测到环: 节点 {idx}")
             return True
         if idx in visited:
             return False
@@ -71,6 +78,8 @@ def check_tree_reachability(records: dict[int, NodePageRecord]) -> list[Consiste
     dfs_cycle(root, set())
 
     orphans = set(records.keys()) - visited
+    if orphans:
+        logger.warning(f"发现 {len(orphans)} 个孤儿节点")
     for o in sorted(orphans):
         issues.append(
             ConsistencyIssue(
@@ -85,6 +94,7 @@ def check_tree_reachability(records: dict[int, NodePageRecord]) -> list[Consiste
 
 def check_level_continuity(records: dict[int, NodePageRecord]) -> list[ConsistencyIssue]:
     issues: list[ConsistencyIssue] = []
+    skip_count = 0
     for r in records.values():
         for c in r.children:
             child = records.get(c)
@@ -102,6 +112,9 @@ def check_level_continuity(records: dict[int, NodePageRecord]) -> list[Consisten
                         c,
                     )
                 )
+                skip_count += 1
+    if skip_count:
+        logger.debug(f"发现 {skip_count} 个层级不连续的父子关系")
     return issues
 
 
@@ -111,6 +124,7 @@ def check_nodepage_vs_doc(
 ) -> list[ConsistencyIssue]:
     """同一 index 上 nodePage 与 3dNodeIndexDocument 的 children/parent 是否冲突。"""
     issues: list[ConsistencyIssue] = []
+    mismatch_count = 0
     for idx, doc in node_docs.items():
         rec = records.get(idx)
         if rec is None:
@@ -127,6 +141,7 @@ def check_nodepage_vs_doc(
                         idx,
                     )
                 )
+                mismatch_count += 1
         if doc.parent is not None and rec.parent_index is not None and doc.parent != rec.parent_index:
             issues.append(
                 ConsistencyIssue(
@@ -136,6 +151,9 @@ def check_nodepage_vs_doc(
                     idx,
                 )
             )
+            mismatch_count += 1
+    if mismatch_count:
+        logger.debug(f"发现 {mismatch_count} 个 nodePage 与节点文档不一致的情况")
     return issues
 
 

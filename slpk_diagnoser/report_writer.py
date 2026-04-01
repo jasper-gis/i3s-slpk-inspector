@@ -6,6 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from slpk_diagnoser.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 def format_report_text(payload: dict[str, Any]) -> str:
     lines: list[str] = []
@@ -67,7 +71,29 @@ def format_report_text(payload: dict[str, Any]) -> str:
 
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    try:
+        p = Path(path)
+        logger.debug(f"准备写入 JSON 到: {p}")
+
+        if p.exists() and not p.is_file():
+            raise IsADirectoryError(f"目标路径已存在且不是文件: {p}")
+
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"JSON 报告成功写入: {p}")
+
+    except PermissionError as e:
+        logger.error(f"没有权限写入文件: {path}")
+        raise
+    except OSError as e:
+        logger.error(f"写入 JSON 时发生操作系统错误: {e}")
+        raise
+    except TypeError as e:
+        logger.error(f"JSON 序列化失败: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"写入 JSON 时发生未预期的错误: {e}")
+        raise
