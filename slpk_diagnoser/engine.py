@@ -146,6 +146,14 @@ def diagnose_slpk(package_path: str) -> dict[str, Any]:
             if k.lower().startswith("nodepages/") and k.lower().endswith(".json.gz")
         )
         summary["node_pages_files"] = len(np_keys)
+        if sinfo and sinfo.has_node_pages_decl and not np_keys:
+            issues.append(
+                {
+                    "severity": "WARNING",
+                    "code": "NODEPAGES_DECL_ONLY",
+                    "message": "场景层声明了 nodePages，但包内未找到 nodePages/*.json.gz 条目",
+                }
+            )
 
         records: dict[int, NodePageRecord] = {}
         for nk in np_keys:
