@@ -25,12 +25,12 @@ from slpk_diagnoser.lod_checker import (
 from slpk_diagnoser.logger import (
     ensure_default_logging,
     get_logger,
-    log_operation_complete,
-    log_operation_start,
+    log_timed_operation,
+    sanitize_text,
 )
 from slpk_diagnoser.node_parser import NodeIndexDocSummary, parse_3d_node_index_document
 from slpk_diagnoser.nodepage_parser import NodePageRecord, parse_node_page_json
-from slpk_diagnoser.package_reader import open_package_reader
+from slpk_diagnoser.package_reader import is_cloud_storage_uri, open_package_reader
 from slpk_diagnoser.scene_layer_parser import parse_scene_layer
 from slpk_diagnoser.scoring import compute_scores, grade_label
 from slpk_diagnoser.spatial_checker import (
@@ -43,40 +43,52 @@ from slpk_diagnoser.texture_checker import check_texture_refs_exist
 logger = get_logger(__name__)
 
 
-def _i3s_tuple_version(v: str | None) -> tuple[int, ...]:
-    if not v:
+def _i3s_tuple_version(value: str | None) -> tuple[int, ...]:
+    if not value:
         return ()
-    parts = re.findall(r"\d+", v)
-    return tuple(int(x) for x in parts)
+    return tuple(int(part) for part in re.findall(r"\d+", value))
 
 
-def _is_old_i3s(v: str | None) -> bool:
-    t = _i3s_tuple_version(v)
-    if not t:
+def _is_old_i3s(value: str | None) -> bool:
+    version = _i3s_tuple_version(value)
+    if not version:
         return False
-    return t[0] < 2 and (len(t) < 2 or (t[0] == 1 and t[1] <= 6))
+    return version[0] < 2 and (len(version) < 2 or (version[0] == 1 and version[1] <= 6))
 
 
 def _extract_node_id_from_path(norm_path: str) -> int | None:
-    m = re.match(r"nodes/(\d+)/", norm_path)
-    if m:
-        return int(m.group(1))
+    match = re.match(r"nodes/(\d+)/", norm_path)
+    if match:
+        return int(match.group(1))
     return None
 
 
-def diagnose_slpk(package_path: str) -> dict[str, Any]:
-    try:
-        ensure_default_logging()
-        path = str(Path(package_path).expanduser().resolve())
-        log_operation_start(logger, "SLPK 诊断", package_path=path)
+def _normalize_package_display(package_path: str) -> str:
+    if is_cloud_storage_uri(package_path):
+        return sanitize_text(package_path)
+    return str(Path(package_path).expanduser().resolve())
 
+
+def diagnose_slpk(package_path: str) -> dict[str, Any]:
+    ensure_default_logging()
+    display_path = _normalize_package_display(package_path)
+
+    with log_timed_operation(logger, "SLPK/I3S 诊断", package=display_path):
         issues: list[dict[str, Any]] = []
         summary: dict[str, Any] = {
-            "package_path": path,
+            "package_path": display_path,
             "input_kind": None,
+            "reader_type": None,
+            "storage_provider": None,
+            "storage_endpoint": None,
+            "storage_bucket": None,
+            "storage_prefix": None,
+            "inspection_scope": None,
             "has_3d_scene_layer": False,
             "i3s_version": None,
             "layer_type": None,
+            "store_version": None,
+            "store_profile": None,
             "total_nodes": 0,
             "max_level": None,
             "node_pages_files": 0,
@@ -95,27 +107,41 @@ def diagnose_slpk(package_path: str) -> dict[str, Any]:
             "severity_counts": {},
             "lod_subscores": {},
             "i3s_old_version": False,
+            "mapping_source": None,
+            "mapping_document": None,
+            "mapping_entries": 0,
+            "mapping_duplicate_logicals": 0,
+            "mapping_duplicate_targets": 0,
+            "mapping_missing_targets": 0,
+            "mapping_unused_objects": 0,
+            "mapping_notes": [],
         }
 
-        with open_package_reader(path) as reader:
-            summary["input_kind"] = "slpk_zip" if path.lower().endswith((".slpk", ".eslpk")) else "eslpk_or_object_dir"
-            log_operation_start(logger, "包结构检查")
-            insp = reader.inspect()
-            summary["broken_gzip_count"] = len(insp.broken_gzip)
-            summary["central_dir_ok"] = insp.central_dir_ok
-            summary["has_hash_index"] = reader.has_special_hash_index()
-            summary["has_metadata_json"] = reader.raw_exists("metadata.json")
-            log_operation_complete(
+        with open_package_reader(package_path) as reader:
+            source_info = reader.describe_source()
+            summary.update(source_info)
+            summary["input_kind"] = source_info.get("reader_type")
+
+            with log_timed_operation(
                 logger,
                 "包结构检查",
-                central_dir_ok=summary["central_dir_ok"],
-                broken_gzip=summary["broken_gzip_count"],
-            )
+                reader_type=summary["reader_type"],
+                provider=summary["storage_provider"],
+            ):
+                inspection = reader.inspect()
+                summary["inspection_scope"] = inspection.inspection_scope
+                summary["broken_gzip_count"] = len(inspection.broken_gzip)
+                summary["central_dir_ok"] = inspection.central_dir_ok
+                summary["has_hash_index"] = reader.has_special_hash_index()
+                summary["has_metadata_json"] = reader.raw_exists("metadata.json")
 
-            for msg in insp.zip_errors:
-                issues.append({"severity": "ERROR", "code": "ZIP", "message": msg})
-            for bg in insp.broken_gzip:
-                issues.append({"severity": "ERROR", "code": "BAD_GZIP", "message": bg})
+                for message in inspection.zip_errors:
+                    issues.append({"severity": "ERROR", "code": "ZIP", "message": message})
+                for message in inspection.broken_gzip:
+                    issues.append({"severity": "ERROR", "code": "BAD_GZIP", "message": message})
+                issues.extend(inspection.issues)
+                for note in inspection.notes:
+                    issues.append({"severity": "INFO", "code": "INSPECT_NOTE", "message": note})
 
             scene_name = "3dSceneLayer.json.gz"
             if not reader.raw_exists(scene_name):
@@ -126,288 +152,298 @@ def diagnose_slpk(package_path: str) -> dict[str, Any]:
                         "message": f"缺少根文档 {scene_name}",
                     }
                 )
-                logger.error(f"缺少必要的根文档: {scene_name}")
-                payload = _finalize(path, summary, issues)
-                log_operation_complete(logger, "SLPK 诊断", success=False, reason="缺少根文档")
-                return payload
+                return _finalize(display_path, summary, issues)
 
             summary["has_3d_scene_layer"] = True
-            logger.info(f"读取场景层文档: {scene_name}")
-            doc, jerr = reader.read_json_gz(scene_name)
-            if jerr or not isinstance(doc, dict):
-                issues.append(
-                    {
-                        "severity": "ERROR",
-                        "code": "SCENE_LAYER_PARSE",
-                        "message": f"无法解析 {scene_name}: {jerr}",
-                    }
-                )
-                logger.error(f"场景层文档解析失败: {jerr}")
-                payload = _finalize(path, summary, issues)
-                log_operation_complete(logger, "SLPK 诊断", success=False, reason="场景层解析失败")
-                return payload
+            with log_timed_operation(logger, "解析场景层根文档", path=scene_name):
+                doc, error = reader.read_json_gz(scene_name)
+                if error or not isinstance(doc, dict):
+                    issues.append(
+                        {
+                            "severity": "ERROR",
+                            "code": "SCENE_LAYER_PARSE",
+                            "message": f"无法解析 {scene_name}: {error}",
+                        }
+                    )
+                    return _finalize(display_path, summary, issues)
 
-            sinfo = parse_scene_layer(doc)
-            if sinfo:
-                summary["i3s_version"] = sinfo.version
-                summary["layer_type"] = sinfo.layer_type
-                summary["i3s_old_version"] = _is_old_i3s(sinfo.version)
-                logger.info(
-                    f"场景层信息: 版本={sinfo.version}, 类型={sinfo.layer_type}, 旧版本={summary['i3s_old_version']}"
-                )
+                scene_info = parse_scene_layer(doc)
+                if scene_info:
+                    summary["i3s_version"] = scene_info.version
+                    summary["layer_type"] = scene_info.layer_type
+                    summary["store_version"] = scene_info.store_version
+                    summary["store_profile"] = scene_info.store_profile
+                    summary["i3s_old_version"] = _is_old_i3s(scene_info.version)
 
-                for href in sinfo.statistics_refs:
-                    summary["statistics_checked"] += 1
-                    h = href.strip().lstrip("/").replace("\\", "/")
-                    if not reader.raw_exists(h) and not reader.raw_exists(h + ".gz"):
-                        summary["statistics_missing"] += 1
-                        issues.append(
-                            {
-                                "severity": "WARNING",
-                                "code": "STATS_MISSING",
-                                "message": f"统计资源未在包内找到: {href}",
-                            }
-                        )
+                    for href in scene_info.statistics_refs:
+                        summary["statistics_checked"] += 1
+                        logical = href.strip().lstrip("/").replace("\\", "/")
+                        if not reader.raw_exists(logical) and not reader.raw_exists(logical + ".gz"):
+                            summary["statistics_missing"] += 1
+                            issues.append(
+                                {
+                                    "severity": "WARNING",
+                                    "code": "STATS_MISSING",
+                                    "message": f"统计资源未在包内找到: {href}",
+                                }
+                            )
+                else:
+                    scene_info = None
 
-            np_keys = sorted(
-                k
-                for k in reader.normalized_keys()
-                if k.lower().startswith("nodepages/") and k.lower().endswith(".json.gz")
+            node_records: dict[int, NodePageRecord] = {}
+            node_pages = sorted(
+                key for key in reader.find_prefix("nodepages") if key.lower().endswith(".json.gz")
             )
-            summary["node_pages_files"] = len(np_keys)
-            logger.info(f"发现 {len(np_keys)} 个 nodePage 文件")
-
-            if sinfo and sinfo.has_node_pages_decl and not np_keys:
+            summary["node_pages_files"] = len(node_pages)
+            if scene_info and scene_info.has_node_pages_decl and not node_pages:
                 issues.append(
                     {
                         "severity": "WARNING",
                         "code": "NODEPAGES_DECL_ONLY",
-                        "message": "场景层声明了 nodePages，但包内未找到 nodePages/*.json.gz 条目",
+                        "message": "场景层声明了 nodePages，但包内未发现 nodepages/*.json.gz。",
                     }
                 )
 
-            records: dict[int, NodePageRecord] = {}
-            log_operation_start(logger, "解析 nodePages")
-            for nk in np_keys:
-                data, err = reader.read_json_gz(nk)
-                if err or not isinstance(data, dict):
-                    issues.append(
-                        {
-                            "severity": "ERROR",
-                            "code": "NODEPAGE_PARSE",
-                            "message": f"{nk}: {err}",
-                        }
-                    )
-                    continue
-                for rec in parse_node_page_json(nk, data):
-                    if rec.index in records:
+            with log_timed_operation(logger, "解析 nodePages", file_count=len(node_pages)):
+                for key in node_pages:
+                    data, error = reader.read_json_gz(key)
+                    if error or not isinstance(data, dict):
                         issues.append(
                             {
-                                "severity": "INFO",
-                                "code": "NODEPAGE_DUP_INDEX",
-                                "message": f"节点 index={rec.index} 在多个 nodePage 重复出现，后解析覆盖",
-                                "node_index": rec.index,
+                                "severity": "ERROR",
+                                "code": "NODEPAGE_PARSE",
+                                "message": f"{key}: {error}",
                             }
                         )
-                    records[rec.index] = rec
-
-            summary["total_nodes"] = len(records)
-            summary["max_level"] = max((r.level for r in records.values() if r.level is not None), default=None)
-            summary["level_stats"] = level_statistics(records)
-            log_operation_complete(
-                logger,
-                "解析 nodePages",
-                total_nodes=summary["total_nodes"],
-                max_level=summary["max_level"],
-            )
-
-            # 节点文档
-            node_docs: dict[int, NodeIndexDocSummary] = {}
-            log_operation_start(logger, "解析节点文档")
-            for logical in reader.normalized_keys():
-                if not logical.lower().endswith("3dnodeindexdocument.json.gz"):
-                    continue
-                nid = _extract_node_id_from_path(logical)
-                data, err = reader.read_json_gz(logical)
-                if err or not isinstance(data, dict):
-                    issues.append(
-                        {
-                            "severity": "WARNING",
-                            "code": "NODE_DOC_PARSE",
-                            "message": f"{logical}: {err}",
-                        }
-                    )
-                    continue
-                summ = parse_3d_node_index_document(logical, data)
-                idx_key = summ.index if summ.index is not None else nid
-                if idx_key is None:
-                    continue
-                node_docs[idx_key] = summ
-            summary["node_documents"] = len(node_docs)
-            log_operation_complete(logger, "解析节点文档", count=summary["node_documents"])
-
-            # 一致性
-            log_operation_start(logger, "一致性检查")
-            for it in check_tree_reachability(records):
-                issues.append(
-                    {
-                        "severity": it.severity,
-                        "code": it.code,
-                        "message": it.message,
-                        "node_index": it.node_index,
-                    }
-                )
-            for it in check_level_continuity(records):
-                issues.append(
-                    {
-                        "severity": it.severity,
-                        "code": it.code,
-                        "message": it.message,
-                        "node_index": it.node_index,
-                    }
-                )
-            for it in check_nodepage_vs_doc(records, node_docs):
-                issues.append(
-                    {
-                        "severity": it.severity,
-                        "code": it.code,
-                        "message": it.message,
-                        "node_index": it.node_index,
-                    }
-                )
-            log_operation_complete(logger, "一致性检查")
-
-            # 空间
-            log_operation_start(logger, "空间检查")
-            for r in records.values():
-                for it in check_mbs_obb_record(r):
-                    issues.append(
-                        {
-                            "severity": it.severity,
-                            "code": it.code,
-                            "message": it.message,
-                            "node_index": it.node_index,
-                        }
-                    )
-                    if it.severity == "WARNING":
-                        summary["spatial_warning_count"] += 1
-
-            for r in records.values():
-                for cidx in r.children:
-                    ch = records.get(cidx)
-                    if ch is None:
                         continue
-                    for it in check_parent_child_mbs(r, ch):
+                    for record in parse_node_page_json(key, data):
+                        if record.index in node_records:
+                            issues.append(
+                                {
+                                    "severity": "INFO",
+                                    "code": "NODEPAGE_DUP_INDEX",
+                                    "message": f"节点 index={record.index} 在多个 nodePage 中重复出现，后者覆盖前者。",
+                                    "node_index": record.index,
+                                }
+                            )
+                        node_records[record.index] = record
+
+            summary["total_nodes"] = len(node_records)
+            summary["max_level"] = max(
+                (record.level for record in node_records.values() if record.level is not None),
+                default=None,
+            )
+            summary["level_stats"] = level_statistics(node_records)
+
+            node_docs = _load_node_documents(reader, node_records, issues)
+            summary["node_documents"] = len(node_docs)
+
+            with log_timed_operation(logger, "一致性检查", total_nodes=summary["total_nodes"]):
+                issues.extend(_consistency_issues(node_records, node_docs))
+
+            with log_timed_operation(logger, "空间检查", total_nodes=summary["total_nodes"]):
+                spatial_issues, warning_count = _spatial_issues(node_records)
+                issues.extend(spatial_issues)
+                summary["spatial_warning_count"] = warning_count
+
+            with log_timed_operation(logger, "LOD 检查", total_nodes=summary["total_nodes"]):
+                mechanism = summarize_lod_mechanism(node_records, node_docs)
+                summary["lod_mechanism"] = mechanism
+                threshold_issues = check_lod_threshold_monotonicity(node_records)
+                selection_issues = check_lod_selection_monotonicity(node_docs)
+                early_geometry_issues = check_early_levels_geometry(node_records)
+                missing_metric_issues = check_missing_lod_metrics(node_records, node_docs)
+                for batch in (
+                    threshold_issues,
+                    selection_issues,
+                    early_geometry_issues,
+                    missing_metric_issues,
+                ):
+                    for item in batch:
                         issues.append(
                             {
-                                "severity": it.severity,
-                                "code": it.code,
-                                "message": it.message,
-                                "node_index": it.node_index,
+                                "severity": item.severity,
+                                "code": item.code,
+                                "message": item.message,
+                                "node_index": item.node_index,
                             }
                         )
-                        if it.severity == "WARNING":
-                            summary["spatial_warning_count"] += 1
+                summary["lod_subscores"] = lod_smoothness_scores(
+                    node_records,
+                    node_docs,
+                    threshold_issues,
+                    selection_issues,
+                    early_geometry_issues,
+                )
 
-            by_level_nodes: dict[int | None, list[NodePageRecord]] = {}
-            for r in records.values():
-                by_level_nodes.setdefault(r.level, []).append(r)
-            for lv, rec_group in by_level_nodes.items():
-                if lv is None or lv < 0:
-                    continue
-                for it in check_sibling_mbs_overlap(rec_group):
-                    issues.append(
-                        {
-                            "severity": it.severity,
-                            "code": it.code,
-                            "message": it.message,
-                            "node_index": it.node_index,
-                        }
-                    )
-            log_operation_complete(logger, "空间检查", warnings=summary["spatial_warning_count"])
-
-            # LOD
-            log_operation_start(logger, "LOD 检查")
-            mech = summarize_lod_mechanism(records, node_docs)
-            summary["lod_mechanism"] = mech
-            lod_t = check_lod_threshold_monotonicity(records)
-            lod_s = check_lod_selection_monotonicity(node_docs)
-            early = check_early_levels_geometry(records)
-            missing_m = check_missing_lod_metrics(records, node_docs)
-            for lst in (lod_t, lod_s, early, missing_m):
-                for it in lst:
-                    issues.append(
-                        {
-                            "severity": it.severity,
-                            "code": it.code,
-                            "message": it.message,
-                            "node_index": it.node_index,
-                        }
-                    )
-            summary["lod_subscores"] = lod_smoothness_scores(
-                records, node_docs, lod_t, lod_s, early
-            )
-            log_operation_complete(logger, "LOD 检查", mechanism=mech["primary_mechanism"])
-
-            # 几何 / 纹理引用
-            log_operation_start(logger, "资源引用检查")
-            for idx, d in node_docs.items():
-                for it in check_geometry_refs_exist(reader, idx, d.geometry_resources):
-                    issues.append({"severity": it.severity, "code": it.code, "message": it.message})
-                    summary["geometry_error_count"] += 1
-                for it in check_texture_refs_exist(reader, idx, d.texture_resources):
-                    issues.append({"severity": it.severity, "code": it.code, "message": it.message})
-                    summary["texture_error_count"] += 1
-
-            # nodePage 有几何标记但无节点文档时，尝试默认 geometries/0
-            for r in records.values():
-                if not r.has_geometry_ref:
-                    continue
-                if r.index in node_docs:
-                    continue
-                for it in check_geometry_refs_exist(reader, r.index, ["geometries/0"]):
-                    if it.severity == "ERROR":
+            with log_timed_operation(logger, "资源引用检查", node_doc_count=len(node_docs)):
+                for node_id, doc_summary in node_docs.items():
+                    for item in check_geometry_refs_exist(reader, node_id, doc_summary.geometry_resources):
                         issues.append(
-                            {
-                                "severity": "INFO",
-                                "code": "GEOM_UNVERIFIED",
-                                "message": f"节点 {r.index} 仅有 nodePage 几何标记，无 3dNodeIndexDocument，未完整验证资源路径",
-                                "node_index": r.index,
-                            }
+                            {"severity": item.severity, "code": item.code, "message": item.message}
                         )
-            log_operation_complete(
-                logger,
-                "资源引用检查",
-                geometry_errors=summary["geometry_error_count"],
-                texture_errors=summary["texture_error_count"],
-            )
+                        summary["geometry_error_count"] += 1
+                    for item in check_texture_refs_exist(reader, node_id, doc_summary.texture_resources):
+                        issues.append(
+                            {"severity": item.severity, "code": item.code, "message": item.message}
+                        )
+                        summary["texture_error_count"] += 1
 
-        payload = _finalize(path, summary, issues)
-        log_operation_complete(
-            logger,
-            "SLPK 诊断",
-            success=True,
-            total_issues=len(issues),
-            grade=payload["grade"],
+                for record in node_records.values():
+                    if not record.has_geometry_ref or record.index in node_docs:
+                        continue
+                    for item in check_geometry_refs_exist(reader, record.index, ["geometries/0"]):
+                        if item.severity == "ERROR":
+                            issues.append(
+                                {
+                                    "severity": "INFO",
+                                    "code": "GEOM_UNVERIFIED",
+                                    "message": f"节点 {record.index} 仅在 nodePage 中出现几何标记，但无 3dNodeIndexDocument，无法完整验证资源路径。",
+                                    "node_index": record.index,
+                                }
+                            )
+
+        return _finalize(display_path, summary, issues)
+
+
+def _load_node_documents(
+    reader: Any,
+    node_records: dict[int, NodePageRecord],
+    issues: list[dict[str, Any]],
+) -> dict[int, NodeIndexDocSummary]:
+    node_docs: dict[int, NodeIndexDocSummary] = {}
+    if node_records:
+        candidates = [f"nodes/{idx}/3dNodeIndexDocument.json.gz" for idx in sorted(node_records)]
+    else:
+        candidates = [
+            key
+            for key in reader.find_prefix("nodes")
+            if key.lower().endswith("3dnodeindexdocument.json.gz")
+        ]
+
+    with log_timed_operation(logger, "解析节点文档", candidate_count=len(candidates)):
+        for logical in candidates:
+            if not reader.raw_exists(logical):
+                continue
+            node_id = _extract_node_id_from_path(logical)
+            data, error = reader.read_json_gz(logical)
+            if error or not isinstance(data, dict):
+                issues.append(
+                    {
+                        "severity": "WARNING",
+                        "code": "NODE_DOC_PARSE",
+                        "message": f"{logical}: {error}",
+                    }
+                )
+                continue
+            summary = parse_3d_node_index_document(logical, data)
+            idx = summary.index if summary.index is not None else node_id
+            if idx is None:
+                continue
+            node_docs[idx] = summary
+    return node_docs
+
+
+def _consistency_issues(
+    node_records: dict[int, NodePageRecord],
+    node_docs: dict[int, NodeIndexDocSummary],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for item in check_tree_reachability(node_records):
+        output.append(
+            {
+                "severity": item.severity,
+                "code": item.code,
+                "message": item.message,
+                "node_index": item.node_index,
+            }
         )
-        return payload
+    for item in check_level_continuity(node_records):
+        output.append(
+            {
+                "severity": item.severity,
+                "code": item.code,
+                "message": item.message,
+                "node_index": item.node_index,
+            }
+        )
+    for item in check_nodepage_vs_doc(node_records, node_docs):
+        output.append(
+            {
+                "severity": item.severity,
+                "code": item.code,
+                "message": item.message,
+                "node_index": item.node_index,
+            }
+        )
+    return output
 
-    except Exception as e:
-        logger.error(f"诊断过程中发生未预期的错误: {type(e).__name__}: {e}")
-        raise
+
+def _spatial_issues(node_records: dict[int, NodePageRecord]) -> tuple[list[dict[str, Any]], int]:
+    output: list[dict[str, Any]] = []
+    warning_count = 0
+
+    for record in node_records.values():
+        for item in check_mbs_obb_record(record):
+            output.append(
+                {
+                    "severity": item.severity,
+                    "code": item.code,
+                    "message": item.message,
+                    "node_index": item.node_index,
+                }
+            )
+            if item.severity == "WARNING":
+                warning_count += 1
+
+    for record in node_records.values():
+        for child_index in record.children:
+            child = node_records.get(child_index)
+            if child is None:
+                continue
+            for item in check_parent_child_mbs(record, child):
+                output.append(
+                    {
+                        "severity": item.severity,
+                        "code": item.code,
+                        "message": item.message,
+                        "node_index": item.node_index,
+                    }
+                )
+                if item.severity == "WARNING":
+                    warning_count += 1
+
+    by_level: dict[int | None, list[NodePageRecord]] = {}
+    for record in node_records.values():
+        by_level.setdefault(record.level, []).append(record)
+
+    for level, items in by_level.items():
+        if level is None or level < 0:
+            continue
+        for item in check_sibling_mbs_overlap(items):
+            output.append(
+                {
+                    "severity": item.severity,
+                    "code": item.code,
+                    "message": item.message,
+                    "node_index": item.node_index,
+                }
+            )
+
+    return output, warning_count
 
 
 def _finalize(path: str, summary: dict[str, Any], issues: list[dict[str, Any]]) -> dict[str, Any]:
-    summary["severity_counts"] = dict(Counter(i["severity"] for i in issues))
+    summary["severity_counts"] = dict(Counter(item["severity"] for item in issues))
     scores = compute_scores(summary)
     suggestions = _build_suggestions(summary, issues)
-    payload = {
+    return {
         "package_path": path,
         "summary": summary,
         "issues": issues,
         "scores": {
             "结构完整性": round(scores.structure_integrity, 1),
-            "几何与包围体质量": round(scores.spatial_quality, 1),
+            "几何与空间质量": round(scores.spatial_quality, 1),
             "纹理与资源闭合": round(scores.texture_quality, 1),
             "LOD 切换质量": round(scores.lod_quality, 1),
             "发布兼容性": round(scores.publish_readiness, 1),
@@ -416,45 +452,40 @@ def _finalize(path: str, summary: dict[str, Any], issues: list[dict[str, Any]]) 
         "grade": grade_label(scores.overall),
         "suggestions": suggestions,
     }
-    return payload
 
 
 def _build_suggestions(summary: dict[str, Any], issues: list[dict[str, Any]]) -> list[str]:
-    sug: list[str] = []
-    codes = {i["code"] for i in issues}
+    suggestions: list[str] = []
+    codes = {item["code"] for item in issues}
+    if summary.get("mapping_missing_targets", 0) > 0:
+        suggestions.append("i3s-mapping 中存在失效对象键，需先修复逻辑路径到对象键的映射关系。")
+    if summary.get("mapping_duplicate_logicals", 0) > 0:
+        suggestions.append("i3s-mapping 出现重复逻辑路径，建议统一为单一来源，避免客户端命中不确定对象。")
     if summary.get("geometry_error_count", 0) > 0:
-        sug.append("存在缺失的几何资源引用，建议在 Pro 或生成端重建场景层缓存并核对节点路径。")
+        suggestions.append("存在缺失的几何资源引用，建议在发布端重建场景层缓存并核对节点资源路径。")
     if summary.get("texture_error_count", 0) > 0:
-        sug.append("存在缺失的纹理资源，请检查 textureData 与共享材质定义是否一致。")
+        suggestions.append("存在缺失的纹理资源，请检查 textureData 与共享材质定义是否一致。")
     if "EARLY_LEVEL_NO_GEOM" in codes:
-        sug.append("前几层缺少粗几何占位，可考虑增加根—低层 coarse mesh 以改善远景与初次加载体验。")
+        suggestions.append("前几层缺少粗几何占位，可考虑补充 coarse mesh 以改善远景与首屏加载体验。")
     if "LOD_THRESH_INVERT" in codes or "LOD_MAXERROR_ORDER" in codes:
-        sug.append("LOD 阈值或 maxError 在父子链上存在异常顺序，建议复查切片与升级工具参数。")
+        suggestions.append("LOD 阈值或 maxError 在父子链上出现倒挂，建议复查切片参数与层级组织。")
     if "MBS_CHILD_OUTSIDE_PARENT" in codes:
-        sug.append("父子包围体关系异常，可能导致视锥剔除与 LOD 切换误判，建议核对包围体计算。")
+        suggestions.append("父子包围体关系异常，可能导致可视裁剪或 LOD 切换误判，建议重算包围体。")
     if summary.get("i3s_old_version"):
-        sug.append("当前 I3S 版本偏旧，ArcGIS 文档建议升级至较新版本以获得性能与结构优化。")
+        suggestions.append("当前 I3S 版本偏旧，建议升级到较新的 I3S 版本后再复检。")
     if summary.get("broken_gzip_count", 0) > 0:
-        sug.append("包内存在无法解压的 .gz 条目，需修复压缩或重新导出 SLPK。")
-    if not sug:
-        sug.append("未生成专项建议：若仍有显示问题，可开启二期几何抽样与纹理分辨率分析。")
-    return sug
+        suggestions.append("包内存在无法解压的 .gz 条目，需要修复压缩数据或重新导出场景层。")
+    if not suggestions:
+        suggestions.append("未发现需要立即处理的严重问题；如客户端仍有异常，可继续做几何抽样与纹理分辨率专项分析。")
+    return suggestions
 
 
 def run_diagnose(package_path: str, json_out: str | None = None) -> str:
-    try:
-        payload = diagnose_slpk(package_path)
-        from slpk_diagnoser.report_writer import format_report_text, write_json
+    payload = diagnose_slpk(package_path)
+    from slpk_diagnoser.report_writer import format_report_text, write_json
 
-        text = format_report_text(payload)
-        if json_out:
-            try:
-                logger.info(f"写入 JSON 输出到: {json_out}")
-                write_json(json_out, payload)
-            except Exception as e:
-                logger.error(f"写入 JSON 输出失败: {e}")
-                raise
-        return text
-    except Exception as e:
-        logger.error(f"执行诊断失败: {e}")
-        raise
+    text = format_report_text(payload)
+    if json_out:
+        with log_timed_operation(logger, "写入 JSON 报告", output=json_out):
+            write_json(json_out, payload)
+    return text
