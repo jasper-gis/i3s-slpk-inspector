@@ -15,9 +15,9 @@ from slpk_diagnoser.logger import configure_logging, get_logger, log_error_conte
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="slpk-diagnose",
-        description="SLPK / I3S 场景层包质量诊断器（结构、资源、LOD、包围体）",
+        description="SLPK/ESLPK/I3S 场景层包质量诊断器（结构、资源、LOD、包围体）",
     )
-    parser.add_argument("slpk", help="输入 .slpk 文件路径")
+    parser.add_argument("package", help="输入包路径：.slpk/.eslpk 文件，或 ESLPK/对象存储镜像目录")
     parser.add_argument(
         "-o",
         "--json-out",
@@ -45,15 +45,12 @@ def main() -> None:
     logger = get_logger(__name__)
 
     try:
-        slpk_path = Path(args.slpk)
-        if not slpk_path.exists():
-            logger.critical(f"输入文件不存在: {args.slpk}")
-            sys.exit(2)
-        if not slpk_path.is_file():
-            logger.critical(f"输入路径不是文件: {args.slpk}")
+        pkg_path = Path(args.package)
+        if not pkg_path.exists():
+            logger.critical(f"输入路径不存在: {args.package}")
             sys.exit(2)
 
-        text = run_diagnose(args.slpk, json_out=args.json_out)
+        text = run_diagnose(args.package, json_out=args.json_out)
         print(text)
         sys.exit(0)
 
