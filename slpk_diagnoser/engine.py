@@ -30,7 +30,7 @@ from slpk_diagnoser.logger import (
 )
 from slpk_diagnoser.node_parser import NodeIndexDocSummary, parse_3d_node_index_document
 from slpk_diagnoser.nodepage_parser import NodePageRecord, parse_node_page_json
-from slpk_diagnoser.package_reader import SlpkPackageReader
+from slpk_diagnoser.package_reader import open_package_reader
 from slpk_diagnoser.scene_layer_parser import parse_scene_layer
 from slpk_diagnoser.scoring import compute_scores, grade_label
 from slpk_diagnoser.spatial_checker import (
@@ -73,6 +73,7 @@ def diagnose_slpk(package_path: str) -> dict[str, Any]:
         issues: list[dict[str, Any]] = []
         summary: dict[str, Any] = {
             "package_path": path,
+            "input_kind": None,
             "has_3d_scene_layer": False,
             "i3s_version": None,
             "layer_type": None,
@@ -96,7 +97,8 @@ def diagnose_slpk(package_path: str) -> dict[str, Any]:
             "i3s_old_version": False,
         }
 
-        with SlpkPackageReader(path) as reader:
+        with open_package_reader(path) as reader:
+            summary["input_kind"] = "slpk_zip" if path.lower().endswith((".slpk", ".eslpk")) else "eslpk_or_object_dir"
             log_operation_start(logger, "包结构检查")
             insp = reader.inspect()
             summary["broken_gzip_count"] = len(insp.broken_gzip)
