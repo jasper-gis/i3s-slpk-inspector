@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from slpk_diagnoser.geometry_checker import resolve_node_path
-from slpk_diagnoser.package_reader import SlpkPackageReader
+from slpk_diagnoser.package_reader import BasePackageReader
 
 
 @dataclass
@@ -17,7 +17,7 @@ class TextureIssue:
 
 
 def check_texture_refs_exist(
-    reader: SlpkPackageReader,
+    reader: BasePackageReader,
     node_id: int,
     hrefs: list[str],
 ) -> list[TextureIssue]:

@@ -1,16 +1,29 @@
-"""包级统一日志：单一路由到命名空间根，子模块仅使用 get_logger，避免重复 Handler。"""
+"""统一日志配置与阶段化日志辅助。"""
 
 from __future__ import annotations
 
 import logging
 import sys
-from typing import Any
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 PACKAGE_LOGGER_NAME = "slpk_diagnoser"
+SENSITIVE_FIELD_HINTS = (
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "signature",
+    "access_key",
+    "accesskey",
+)
 
 
 class ColoredFormatter(logging.Formatter):
-    """控制台 TTY 下为等级着色；不在 LogRecord 上留下副作用。"""
+    """TTY 环境中的彩色日志格式器。"""
 
     COLORS = {
         "DEBUG": "\033[36m",
@@ -26,8 +39,7 @@ class ColoredFormatter(logging.Formatter):
         try:
             if sys.stderr.isatty():
                 color = self.COLORS.get(raw_level, self.COLORS["RESET"])
-                reset = self.COLORS["RESET"]
-                record.levelname = f"{color}{raw_level}{reset}"
+                record.levelname = f"{color}{raw_level}{self.COLORS['RESET']}"
             return super().format(record)
         finally:
             record.levelname = raw_level
@@ -37,47 +49,47 @@ def configure_logging(
     level: int = logging.INFO,
     *,
     verbose: bool = False,
+    log_file: str | None = None,
 ) -> None:
-    """在包命名空间根上配置唯一 StreamHandler；须在 CLI 入口尽早调用一次。
+    """配置包级统一日志输出。"""
 
-    verbose 为 True 时，根 logger 使用 DEBUG，便于排查。
-    """
     root = logging.getLogger(PACKAGE_LOGGER_NAME)
     effective = logging.DEBUG if verbose else level
     root.setLevel(effective)
 
-    for h in root.handlers[:]:
-        root.removeHandler(h)
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
 
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setLevel(logging.DEBUG)
-    if sys.stderr.isatty():
-        handler.setFormatter(
-            ColoredFormatter(
-                "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                datefmt="%H:%M:%S",
-            )
-        )
-    else:
-        handler.setFormatter(
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setLevel(effective)
+    stream_handler.setFormatter(_build_formatter())
+    root.addHandler(stream_handler)
+
+    if log_file:
+        file_path = Path(log_file).expanduser()
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(file_path, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
             logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                datefmt="%H:%M:%S",
+                datefmt="%Y-%m-%d %H:%M:%S",
             )
         )
-    root.addHandler(handler)
+        root.addHandler(file_handler)
+
     root.propagate = False
 
 
 def ensure_default_logging() -> None:
-    """API 直接调用 diagnose 且未走 CLI 时，保证至少有一条 stderr 输出。"""
+    """API 直接调用时，至少保证 stderr 上有日志。"""
+
     root = logging.getLogger(PACKAGE_LOGGER_NAME)
     if not root.handlers:
         configure_logging(logging.INFO, verbose=False)
 
 
 def get_logger(name: str | None = None) -> logging.Logger:
-    """返回子记录器（如 slpk_diagnoser.engine），事件向上汇总至包根。"""
     n = name if name else PACKAGE_LOGGER_NAME
     if not n.startswith(PACKAGE_LOGGER_NAME):
         n = f"{PACKAGE_LOGGER_NAME}.{n}" if n else PACKAGE_LOGGER_NAME
@@ -92,30 +104,100 @@ def setup_logger(
     name: str = PACKAGE_LOGGER_NAME,
     level: int = logging.INFO,
     verbose: bool = False,
+    log_file: str | None = None,
 ) -> logging.Logger:
-    """兼容旧接口：等价于 configure_logging 后返回对应名称的 logger。"""
-    configure_logging(level=level, verbose=verbose)
+    configure_logging(level=level, verbose=verbose, log_file=log_file)
     return get_logger(name)
 
 
+def sanitize_text(value: Any) -> str:
+    text = str(value)
+    if "://" not in text:
+        return text
+
+    parts = urlsplit(text)
+    masked_netloc = parts.netloc
+    if "@" in masked_netloc:
+        _, host = masked_netloc.rsplit("@", 1)
+        masked_netloc = f"***@{host}"
+
+    query_items = []
+    for key, item in parse_qsl(parts.query, keep_blank_values=True):
+        masked = "***" if _looks_sensitive(key) else item
+        query_items.append(f"{key}={masked}")
+    return urlunsplit((parts.scheme, masked_netloc, parts.path, "&".join(query_items), parts.fragment))
+
+
+def sanitize_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in fields.items():
+        if _looks_sensitive(key):
+            safe[key] = "***"
+        elif isinstance(value, (str, Path)):
+            safe[key] = sanitize_text(value)
+        else:
+            safe[key] = value
+    return safe
+
+
 def log_operation_start(logger: logging.Logger, operation: str, **kwargs: Any) -> None:
-    if kwargs:
-        params = ", ".join(f"{k}={v}" for k, v in kwargs.items())
-        logger.info("开始执行: %s (%s)", operation, params)
+    fields = sanitize_fields(kwargs)
+    if fields:
+        logger.info("开始执行: %s (%s)", operation, _format_fields(fields))
     else:
         logger.info("开始执行: %s", operation)
 
 
 def log_operation_complete(logger: logging.Logger, operation: str, **kwargs: Any) -> None:
-    if kwargs:
-        params = ", ".join(f"{k}={v}" for k, v in kwargs.items())
-        logger.info("完成执行: %s (%s)", operation, params)
+    fields = sanitize_fields(kwargs)
+    if fields:
+        logger.info("完成执行: %s (%s)", operation, _format_fields(fields))
     else:
         logger.info("完成执行: %s", operation)
 
 
-def log_error_context(logger: logging.Logger, error: Exception, context: str = "") -> None:
+def log_error_context(logger: logging.Logger, error: Exception, context: str = "", **kwargs: Any) -> None:
+    payload = {"error_type": type(error).__name__, "detail": error}
+    payload.update(kwargs)
+    fields = sanitize_fields(payload)
     if context:
-        logger.error("%s: %s: %s", context, type(error).__name__, error)
+        logger.error("%s (%s)", context, _format_fields(fields))
     else:
-        logger.error("%s: %s", type(error).__name__, error)
+        logger.error("错误 (%s)", _format_fields(fields))
+
+
+@contextmanager
+def log_timed_operation(
+    logger: logging.Logger,
+    operation: str,
+    **kwargs: Any,
+) -> Iterator[None]:
+    """记录阶段开始、结束和耗时。"""
+
+    start = time.perf_counter()
+    log_operation_start(logger, operation, **kwargs)
+    try:
+        yield
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        log_error_context(logger, exc, f"{operation} 失败", elapsed_ms=elapsed_ms, **kwargs)
+        raise
+    else:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        log_operation_complete(logger, operation, elapsed_ms=elapsed_ms, **kwargs)
+
+
+def _build_formatter() -> logging.Formatter:
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    if sys.stderr.isatty():
+        return ColoredFormatter(fmt, datefmt="%H:%M:%S")
+    return logging.Formatter(fmt, datefmt="%H:%M:%S")
+
+
+def _format_fields(fields: dict[str, Any]) -> str:
+    return ", ".join(f"{key}={value}" for key, value in sorted(fields.items()))
+
+
+def _looks_sensitive(name: str) -> bool:
+    lowered = name.lower()
+    return any(hint in lowered for hint in SENSITIVE_FIELD_HINTS)

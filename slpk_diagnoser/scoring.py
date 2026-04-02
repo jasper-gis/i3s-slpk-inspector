@@ -24,12 +24,15 @@ def _clamp(x: float) -> float:
 def compute_scores(summary: dict[str, Any]) -> ScoreCard:
     """根据摘要中的计数与子评分计算五维分数。"""
     sev = Counter(summary.get("severity_counts", {}))
-    n_nodes = max(int(summary.get("total_nodes", 0) or 0), 1)
     err = sev.get("ERROR", 0)
     warn = sev.get("WARNING", 0)
     info_n = sev.get("INFO", 0)
+    mapping_missing = int(summary.get("mapping_missing_targets", 0) or 0)
+    mapping_dup_logical = int(summary.get("mapping_duplicate_logicals", 0) or 0)
+    mapping_dup_target = int(summary.get("mapping_duplicate_targets", 0) or 0)
 
-    structure = 100.0 - min(80.0, err * 8 + warn * 2)
+    mapping_penalty = mapping_missing * 10 + mapping_dup_logical * 6 + mapping_dup_target * 4
+    structure = 100.0 - min(85.0, err * 8 + warn * 2 + mapping_penalty)
     spatial = 100.0 - min(60.0, summary.get("spatial_warning_count", 0) * 3)
     texture = 100.0 - min(80.0, summary.get("texture_error_count", 0) * 10)
     geom = max(0, summary.get("geometry_error_count", 0))
@@ -40,7 +43,7 @@ def compute_scores(summary: dict[str, Any]) -> ScoreCard:
     lod = _clamp(lod - warn * 0.5)
 
     broken_gzip = int(summary.get("broken_gzip_count", 0))
-    pub = 100.0 - min(50.0, broken_gzip * 5 + err * 3)
+    pub = 100.0 - min(60.0, broken_gzip * 5 + err * 3 + mapping_penalty * 0.8)
     if summary.get("has_3d_scene_layer"):
         pub += 2
     if summary.get("central_dir_ok"):
