@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from pathlib import Path
@@ -67,6 +68,63 @@ def _normalize_package_display(package_path: str) -> str:
     if is_cloud_storage_uri(package_path):
         return sanitize_text(package_path)
     return str(Path(package_path).expanduser().resolve())
+
+
+def _is_json_resource(logical_path: str) -> bool:
+    lowered = logical_path.lower()
+    return lowered.endswith(".json") or lowered.endswith(".json.gz")
+
+
+def _canonical_json_resource(logical_path: str) -> str:
+    if logical_path.lower().endswith(".json.gz"):
+        return logical_path[:-3]
+    return logical_path
+
+
+def _preferred_json_resources(logical_paths: list[str]) -> list[str]:
+    selected: dict[str, str] = {}
+    for logical in sorted(logical_paths):
+        if not _is_json_resource(logical):
+            continue
+        canonical = _canonical_json_resource(logical)
+        key = canonical.lower()
+        current = selected.get(key)
+        if current is None or (
+            logical.lower().endswith(".json.gz") and not current.lower().endswith(".json.gz")
+        ):
+            selected[key] = logical
+    return [selected[key] for key in sorted(selected)]
+
+
+def _json_resource_variants(logical_path: str) -> tuple[str, ...]:
+    normalized = logical_path.replace("\\", "/").lstrip("/")
+    if normalized.lower().endswith(".json.gz"):
+        return normalized, normalized[:-3]
+    if normalized.lower().endswith(".json"):
+        return normalized + ".gz", normalized
+    return normalized + ".gz", normalized
+
+
+def _read_json_resource(reader: Any, logical_path: str) -> tuple[Any | None, str | None]:
+    for candidate in _json_resource_variants(logical_path):
+        if not reader.raw_exists(candidate):
+            continue
+        if candidate.lower().endswith(".gz"):
+            return reader.read_json_gz(candidate)
+
+        raw = reader.read_bytes(candidate)
+        if raw is None:
+            return None, "missing"
+        try:
+            return json.loads(raw.decode("utf-8")), None
+        except UnicodeDecodeError as exc:
+            return None, f"UTF-8 解码失败: {exc}"
+        except json.JSONDecodeError as exc:
+            return None, f"JSON 解析失败: 位置 {exc.pos}, 错误: {exc.msg}"
+        except Exception as exc:
+            return None, f"JSON 处理错误: {exc}"
+
+    return None, "missing"
 
 
 def diagnose_slpk(package_path: str) -> dict[str, Any]:
@@ -143,26 +201,26 @@ def diagnose_slpk(package_path: str) -> dict[str, Any]:
                 for note in inspection.notes:
                     issues.append({"severity": "INFO", "code": "INSPECT_NOTE", "message": note})
 
-            scene_name = "3dSceneLayer.json.gz"
-            if not reader.raw_exists(scene_name):
+            scene_name = "3dSceneLayer.json"
+            doc, error = _read_json_resource(reader, scene_name)
+            if error == "missing":
                 issues.append(
                     {
                         "severity": "ERROR",
                         "code": "NO_SCENE_LAYER",
-                        "message": f"缺少根文档 {scene_name}",
+                        "message": f"缺少根文档 {scene_name}[.gz]",
                     }
                 )
                 return _finalize(display_path, summary, issues)
 
             summary["has_3d_scene_layer"] = True
-            with log_timed_operation(logger, "解析场景层根文档", path=scene_name):
-                doc, error = reader.read_json_gz(scene_name)
+            with log_timed_operation(logger, "解析场景层根文档", path=f"{scene_name}[.gz]"):
                 if error or not isinstance(doc, dict):
                     issues.append(
                         {
                             "severity": "ERROR",
                             "code": "SCENE_LAYER_PARSE",
-                            "message": f"无法解析 {scene_name}: {error}",
+                            "message": f"无法解析 {scene_name}[.gz]: {error}",
                         }
                     )
                     return _finalize(display_path, summary, issues)
@@ -191,8 +249,12 @@ def diagnose_slpk(package_path: str) -> dict[str, Any]:
                     scene_info = None
 
             node_records: dict[int, NodePageRecord] = {}
-            node_pages = sorted(
-                key for key in reader.find_prefix("nodepages") if key.lower().endswith(".json.gz")
+            node_pages = _preferred_json_resources(
+                [
+                    key
+                    for key in reader.find_prefix("nodepages")
+                    if _canonical_json_resource(key).lower().startswith("nodepages/")
+                ]
             )
             summary["node_pages_files"] = len(node_pages)
             if scene_info and scene_info.has_node_pages_decl and not node_pages:
@@ -200,13 +262,13 @@ def diagnose_slpk(package_path: str) -> dict[str, Any]:
                     {
                         "severity": "WARNING",
                         "code": "NODEPAGES_DECL_ONLY",
-                        "message": "场景层声明了 nodePages，但包内未发现 nodepages/*.json.gz。",
+                        "message": "场景层声明了 nodePages，但包内未发现 nodepages/*.json[.gz]。",
                     }
                 )
 
             with log_timed_operation(logger, "解析 nodePages", file_count=len(node_pages)):
                 for key in node_pages:
-                    data, error = reader.read_json_gz(key)
+                    data, error = _read_json_resource(reader, key)
                     if error or not isinstance(data, dict):
                         issues.append(
                             {
@@ -313,20 +375,20 @@ def _load_node_documents(
 ) -> dict[int, NodeIndexDocSummary]:
     node_docs: dict[int, NodeIndexDocSummary] = {}
     if node_records:
-        candidates = [f"nodes/{idx}/3dNodeIndexDocument.json.gz" for idx in sorted(node_records)]
+        candidates = [f"nodes/{idx}/3dNodeIndexDocument.json" for idx in sorted(node_records)]
     else:
-        candidates = [
-            key
-            for key in reader.find_prefix("nodes")
-            if key.lower().endswith("3dnodeindexdocument.json.gz")
-        ]
+        candidates = _preferred_json_resources(
+            [
+                key
+                for key in reader.find_prefix("nodes")
+                if _canonical_json_resource(key).lower().endswith("3dnodeindexdocument.json")
+            ]
+        )
 
     with log_timed_operation(logger, "解析节点文档", candidate_count=len(candidates)):
         for logical in candidates:
-            if not reader.raw_exists(logical):
-                continue
             node_id = _extract_node_id_from_path(logical)
-            data, error = reader.read_json_gz(logical)
+            data, error = _read_json_resource(reader, logical)
             if error or not isinstance(data, dict):
                 issues.append(
                     {
