@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slpk-diagnoser"
-version = "0.1.0"
+version = "0.2.0"
 description = "SLPK / I3S 场景层包质量诊断工具"
 requires-python = ">=3.10"
 dependencies = []
+
+[project.optional-dependencies]
+cloud = ["minio", "oss2"]
 
 [project.scripts]
 slpk-diagnose = "slpk_diagnoser.cli:main"

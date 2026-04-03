@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from slpk_diagnoser.package_reader import SlpkPackageReader
+from slpk_diagnoser.package_reader import BasePackageReader
 
 
 @dataclass
@@ -23,7 +23,7 @@ def resolve_node_path(node_id: int, href: str) -> str:
 
 
 def check_geometry_refs_exist(
-    reader: SlpkPackageReader,
+    reader: BasePackageReader,
     node_id: int,
     hrefs: list[str],
 ) -> list[GeometryIssue]:
